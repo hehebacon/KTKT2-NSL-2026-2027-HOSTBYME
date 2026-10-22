@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#include <ctype.h>
+#include <string.h>
+
 #include "Config.h"
 
 namespace {
@@ -11,7 +14,9 @@ enum class SystemState : uint8_t {
 SystemState state = SystemState::BOOTING;
 uint32_t bootMs = 0;
 uint32_t lastStatusMs = 0;
-String commandBuffer;
+char commandBuffer[Config::COMMAND_LINE_MAX + 1] = {};
+size_t commandLength = 0;
+bool discardUntilNewline = false;
 
 const char* stateName(SystemState value) {
   switch (value) {
@@ -52,31 +57,50 @@ bool runSoftwareSelfTest() {
   bool ok = true;
   ok = ok && (Config::SERIAL_BAUD > 0);
   ok = ok && (Config::STATUS_INTERVAL_MS >= 100);
+  ok = ok && (Config::COMMAND_LINE_MAX >= 16);
   ok = ok && Config::STARTUP_INHIBITED;
   ok = ok && !Config::ACTUATOR_OUTPUTS_IMPLEMENTED;
   ok = ok && !Config::FLIGHT_CONTROL_IMPLEMENTED;
 
   Serial.printf("Software self-test: %s\n", ok ? "PASS" : "FAIL");
-  Serial.println("Note: this does not test sensors, motors, battery, or flight.");
+  Serial.println("Scope: constants and safe defaults only.");
+  Serial.println("Not tested: sensors, motors, battery, radio, or flight.");
   return ok;
 }
 
-void handleCommand(String command) {
-  command.trim();
-  command.toLowerCase();
+void handleCommand(char* command) {
+  for (size_t i = 0; command[i] != '\0'; ++i) {
+    command[i] = static_cast<char>(
+        tolower(static_cast<unsigned char>(command[i])));
+  }
 
-  if (command == "help") {
+  if (strcmp(command, "help") == 0) {
     printHelp();
-  } else if (command == "status") {
+  } else if (strcmp(command, "status") == 0) {
     printStatus();
-  } else if (command == "selftest") {
+  } else if (strcmp(command, "selftest") == 0) {
     runSoftwareSelfTest();
-  } else if (command.length() == 0) {
+  } else if (command[0] == '\0') {
     // Ignore blank lines.
   } else {
-    Serial.printf("Unknown command: %s\n", command.c_str());
+    Serial.printf("Unknown command: %s\n", command);
     Serial.println("Type 'help' for available commands.");
   }
+}
+
+void finishLine() {
+  if (discardUntilNewline) {
+    discardUntilNewline = false;
+    commandLength = 0;
+    commandBuffer[0] = '\0';
+    Serial.println("Input too long; command discarded.");
+    return;
+  }
+
+  commandBuffer[commandLength] = '\0';
+  handleCommand(commandBuffer);
+  commandLength = 0;
+  commandBuffer[0] = '\0';
 }
 
 void pollSerial() {
@@ -84,16 +108,23 @@ void pollSerial() {
     const char c = static_cast<char>(Serial.read());
 
     if (c == '\r' || c == '\n') {
-      if (commandBuffer.length() > 0) {
-        handleCommand(commandBuffer);
-        commandBuffer = "";
+      if (commandLength > 0 || discardUntilNewline) {
+        finishLine();
       }
-    } else if (c >= 32 && c <= 126) {
-      if (commandBuffer.length() < Config::COMMAND_LINE_MAX) {
-        commandBuffer += c;
+      continue;
+    }
+
+    if (discardUntilNewline) {
+      continue;
+    }
+
+    if (c >= 32 && c <= 126) {
+      if (commandLength < Config::COMMAND_LINE_MAX) {
+        commandBuffer[commandLength++] = c;
       } else {
-        commandBuffer = "";
-        Serial.println("Input too long; command discarded.");
+        discardUntilNewline = true;
+        commandLength = 0;
+        commandBuffer[0] = '\0';
       }
     }
   }
@@ -124,8 +155,6 @@ void loop() {
   const uint32_t now = millis();
   if (now - lastStatusMs >= Config::STATUS_INTERVAL_MS) {
     lastStatusMs = now;
-    // Keep the system inhibited until a verified architecture and
-    // safety-reviewed integration are implemented.
     state = SystemState::INHIBITED;
   }
 
